@@ -1,8 +1,11 @@
 #pragma once
 #include "memory/allocator.h"
 
-#include <array>
+#include <algorithm>
+#include <bit>
 #include <mutex>
+#include <new>
+#include <vector>
 
 namespace Memory::RenderPassCache
 {
@@ -29,24 +32,51 @@ namespace Memory::RenderPassCache
         // read still sees the original valid shader/lights. The age test is an
         // unsigned subtraction (wrap-safe) and does not assume the counter advances
         // by one per call, so a frozen counter (loading screen, pause) holds passes
-        // longer rather than freeing them early. kMaxQuarantined bounds memory: if
-        // the ring fills (extreme churn or a long frozen-counter span) the oldest
-        // pass is force-freed. Allocation-free (fixed ring) so the render hot path
-        // adds no heap traffic; restores the safety of the engine's original pool
-        // (freed memory stays pass-shaped) while keeping EF's dynamic growth.
+        // longer rather than freeing them early.
+        //
+        // OVERFLOW POLICY. The ring is bounded so memory cannot run away. When it
+        // fills, every entry is by construction YOUNGER than kQuarantineFrames --
+        // the drain loop in Deallocate has already released everything older -- so
+        // freeing the oldest to make room would hand back exactly the memory this
+        // quarantine exists to protect, producing the use-after-free it was written
+        // to prevent. (That was the pre-7.6.x behaviour and it is reachable in
+        // practice: during a fast travel or any load screen the render frame counter
+        // stops advancing while the scene graph is torn down and rebuilt, so nothing
+        // drains while retires pour in.) The ring therefore DROPS the oldest
+        // reference without freeing it -- the pass is leaked, ~72 bytes plus its
+        // sceneLights array -- and logs. Leaking a bounded amount is strictly
+        // preferable to a UAF CTD, and uRenderPassQuarantineSize lets the ring be
+        // sized so overflow does not happen at all. Retire stays allocation-free
+        // (the ring is sized once at Install and its capacity is a power of two, so
+        // the wrap is a mask, not a division), restoring the safety of the engine's
+        // original pool (freed memory stays pass-shaped) while keeping EF's dynamic
+        // growth.
         inline constexpr std::uint32_t kQuarantineFrames = 3;
-        inline constexpr std::size_t   kMaxQuarantined = 16384;
         inline constexpr std::uint32_t kRetiredTag = 0xD1ED0FF5u;  // pad44 sentinel: pass is quarantined
+
+        // uRenderPassQuarantineSize is rounded up to a power of two and clamped to
+        // this range. The floor keeps a pathological setting from degenerating into
+        // "leak everything"; the ceiling bounds the ring itself at 64 MB.
+        inline constexpr std::size_t kMinQuarantined = 1024;
+        inline constexpr std::size_t kMaxQuarantined = 4194304;
+
+        // Log the first overflow, then at most one line per this many drops, so a
+        // sustained overflow is visible in the log without flooding it. The previous
+        // `static bool warned` logged exactly once per session, which understated a
+        // sustained overflow by an unbounded factor.
+        inline constexpr std::uint64_t kOverflowLogInterval = 4096;
 
         struct RetiredPass
         {
             RE::BSRenderPass* pass;
             std::uint32_t     frame;
         };
-        inline std::array<RetiredPass, kMaxQuarantined> s_ring;
-        inline std::size_t                              s_head = 0;   // next write slot
-        inline std::size_t                              s_count = 0;  // live entries
-        inline std::mutex                               s_retireMutex;
+        inline std::vector<RetiredPass> s_ring;
+        inline std::size_t              s_mask = 0;   // capacity - 1 (capacity is a power of two)
+        inline std::size_t              s_head = 0;   // next write slot
+        inline std::size_t              s_count = 0;  // live entries
+        inline std::uint64_t            s_dropped = 0;
+        inline std::mutex               s_retireMutex;
 
         inline std::uint32_t CurrentFrame()
         {
@@ -61,10 +91,15 @@ namespace Memory::RenderPassCache
             Allocator::GetAllocator()->DeallocateAligned(a_renderPass);
         }
 
-        // Free and drop the oldest quarantined pass. Caller holds s_retireMutex.
-        inline void FreeOldest()
+        // Drop the oldest quarantined entry. Caller holds s_retireMutex.
+        // a_free == false abandons the pass (leak) instead of releasing it; see the
+        // overflow policy above for why the overflow path must never free.
+        inline void DropOldest(bool a_free)
         {
-            FreeNow(s_ring[(s_head + kMaxQuarantined - s_count) % kMaxQuarantined].pass);
+            auto& slot = s_ring[(s_head + s_ring.size() - s_count) & s_mask];
+            if (a_free)
+                FreeNow(slot.pass);
+            slot.pass = nullptr;
             --s_count;
         }
 
@@ -140,30 +175,55 @@ namespace Memory::RenderPassCache
 
             // Drain everything old enough to be past any in-flight reference.
             while (s_count > 0) {
-                const auto& oldest = s_ring[(s_head + kMaxQuarantined - s_count) % kMaxQuarantined];
+                const auto& oldest = s_ring[(s_head + s_ring.size() - s_count) & s_mask];
                 if (now - oldest.frame < kQuarantineFrames)
                     break;
-                FreeOldest();
+                DropOldest(true);
             }
 
             // Safety valve: never exceed the ring (extreme churn / frozen counter).
-            if (s_count == kMaxQuarantined) {
-                static bool warned = false;
-                if (!warned) {
-                    warned = true;
-                    logger::warn("render pass quarantine full ({}); force-freeing oldest"sv, kMaxQuarantined);
+            // Everything still queued is younger than kQuarantineFrames, so the
+            // oldest is abandoned rather than freed -- see the overflow policy above.
+            if (s_count == s_ring.size()) {
+                if (s_dropped++ % kOverflowLogInterval == 0) {
+                    logger::warn(
+                        "render pass quarantine full ({}); leaking oldest pass rather than freeing it early "
+                        "({} leaked so far) -- raise uRenderPassQuarantineSize"sv,
+                        s_ring.size(), s_dropped);
                 }
-                FreeOldest();
+                DropOldest(false);
             }
 
             a_renderPass->pad44 = kRetiredTag;
             s_ring[s_head] = { a_renderPass, now };
-            s_head = (s_head + 1) % kMaxQuarantined;
+            s_head = (s_head + 1) & s_mask;
             ++s_count;
         }
 
-        inline void Install()
+        // Returns the ring capacity to use: uRenderPassQuarantineSize clamped to
+        // [kMinQuarantined, kMaxQuarantined] and rounded up to a power of two so the
+        // wrap in Deallocate stays a mask.
+        inline std::size_t ResolveCapacity()
         {
+            auto requested = static_cast<std::size_t>(Settings::MemoryManager::uRenderPassQuarantineSize.GetValue());
+            requested = std::clamp(requested, kMinQuarantined, kMaxQuarantined);
+            return std::bit_ceil(requested);
+        }
+
+        inline bool Install()
+        {
+            const auto capacity = ResolveCapacity();
+            try {
+                s_ring.assign(capacity, RetiredPass{ nullptr, 0 });
+            } catch (const std::bad_alloc&) {
+                logger::error("render pass cache: could not allocate a {}-entry quarantine, patch NOT installed"sv, capacity);
+                return false;
+            }
+            s_mask = capacity - 1;
+            s_head = 0;
+            s_count = 0;
+            s_dropped = 0;
+
             REL::Relocation allocate{ RELOCATION_ID(100717, 107497) };
             REL::Relocation deallocate{ RELOCATION_ID(100718, 107498) };
             REL::Relocation setlights{ RELOCATION_ID(100711, 107490) };
@@ -184,12 +244,13 @@ namespace Memory::RenderPassCache
             REL::Relocation clear{ RELOCATION_ID(100722, 107502) };
             clear.write_fill(REL::INT3, VAR_NUM(0xE7, 0x16B, 0xB7));
             clear.write(REL::RET);
+            return true;
         }
     }
 
     inline void Install()
     {
-        detail::Install();
-        logger::info("installed render pass cache patch"sv);
+        if (detail::Install())
+            logger::info("installed render pass cache patch (quarantine {} entries)"sv, detail::s_ring.size());
     }
 }
