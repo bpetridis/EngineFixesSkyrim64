@@ -51,7 +51,13 @@ namespace Memory::RenderPassCache
         // the wrap is a mask, not a division), restoring the safety of the engine's
         // original pool (freed memory stays pass-shaped) while keeping EF's dynamic
         // growth.
-        inline constexpr std::uint32_t kQuarantineFrames = 3;
+        // DIAGNOSTIC (see CLAUDE-HANDOFF.md), remove before ship: kQuarantineFrames is
+        // now a runtime value driven by uRenderPassQuarantineFrames, so hypothesis H1
+        // (frame-count aging vs. wall-clock hazard) can be A/B'd without recompiling.
+        // Set in Install(), clamped to [kMinQuarantineFrames, kMaxQuarantineFrames].
+        inline std::uint32_t          s_quarantineFrames = 3;
+        inline constexpr std::uint32_t kMinQuarantineFrames = 1;
+        inline constexpr std::uint32_t kMaxQuarantineFrames = 100000;
         inline constexpr std::uint32_t kRetiredTag = 0xD1ED0FF5u;  // pad44 sentinel: pass is quarantined
 
         // uRenderPassQuarantineSize is rounded up to a power of two and clamped to
@@ -65,6 +71,23 @@ namespace Memory::RenderPassCache
         // `static bool warned` logged exactly once per session, which understated a
         // sustained overflow by an unbounded factor.
         inline constexpr std::uint64_t kOverflowLogInterval = 4096;
+
+        // DIAGNOSTIC (see CLAUDE-HANDOFF.md), remove before ship: gated by
+        // bRenderPassLogFrameAnomalies. kFrameAnomalyAgeThreshold flags a drained
+        // entry whose age is implausible for a healthy quarantine -- evidence of a
+        // frame-counter jump (hypothesis H1). Both anomaly warnings are rate-limited
+        // the same way the overflow warning is.
+        inline constexpr std::uint32_t kFrameAnomalyAgeThreshold = 1000;
+        inline constexpr std::uint64_t kAnomalyLogInterval = 256;
+        inline bool                    s_logFrameAnomalies = false;
+        inline std::uint64_t           s_nullFrameCount = 0;
+        inline std::uint64_t           s_agedFrameCount = 0;
+
+        // DIAGNOSTIC (see CLAUDE-HANDOFF.md), remove before ship: gated by
+        // bRenderPassQuarantineLights. Tests hypothesis H2 -- SetLights frees
+        // sceneLights immediately, with no quarantine at all. When true, the old
+        // array is leaked instead of freed.
+        inline bool s_quarantineLights = false;
 
         struct RetiredPass
         {
@@ -81,7 +104,15 @@ namespace Memory::RenderPassCache
         inline std::uint32_t CurrentFrame()
         {
             const auto* state = RE::BSGraphics::State::GetSingleton();
-            return state ? state->frameCount : 0;
+            if (state)
+                return state->frameCount;
+
+            if (s_logFrameAnomalies && s_nullFrameCount++ % kAnomalyLogInterval == 0) {
+                logger::warn(
+                    "render pass cache: BSGraphics::State singleton null, frame stamped 0 ({} so far)"sv,
+                    s_nullFrameCount);
+            }
+            return 0;
         }
 
         inline void FreeNow(RE::BSRenderPass* a_renderPass)
@@ -107,7 +138,11 @@ namespace Memory::RenderPassCache
         {
             if (a_numLights != a_renderPass->numLights) {
                 if (a_renderPass->sceneLights) {
-                    Allocator::GetAllocator()->DeallocateAligned(a_renderPass->sceneLights);
+                    // DIAGNOSTIC (see CLAUDE-HANDOFF.md), remove before ship: tests H2 by
+                    // never releasing this array. Leaking is unambiguous; a real fix would
+                    // need its own quarantine, not attempted here.
+                    if (!s_quarantineLights)
+                        Allocator::GetAllocator()->DeallocateAligned(a_renderPass->sceneLights);
                     a_renderPass->sceneLights = nullptr;
                 }
                 if (a_numLights != 0) {
@@ -176,8 +211,15 @@ namespace Memory::RenderPassCache
             // Drain everything old enough to be past any in-flight reference.
             while (s_count > 0) {
                 const auto& oldest = s_ring[(s_head + s_ring.size() - s_count) & s_mask];
-                if (now - oldest.frame < kQuarantineFrames)
+                const auto  age = now - oldest.frame;
+                if (age < s_quarantineFrames)
                     break;
+                if (s_logFrameAnomalies && age > kFrameAnomalyAgeThreshold && s_agedFrameCount++ % kAnomalyLogInterval == 0) {
+                    logger::warn(
+                        "render pass cache: drained a pass aged {} frames (quarantine is {}) -- possible frame "
+                        "counter jump ({} so far)"sv,
+                        age, s_quarantineFrames, s_agedFrameCount);
+                }
                 DropOldest(true);
             }
 
@@ -223,6 +265,14 @@ namespace Memory::RenderPassCache
             s_head = 0;
             s_count = 0;
             s_dropped = 0;
+
+            // DIAGNOSTIC (see CLAUDE-HANDOFF.md), remove before ship.
+            s_quarantineFrames = std::clamp(
+                Settings::MemoryManager::uRenderPassQuarantineFrames.GetValue(), kMinQuarantineFrames, kMaxQuarantineFrames);
+            s_quarantineLights = Settings::MemoryManager::bRenderPassQuarantineLights.GetValue();
+            s_logFrameAnomalies = Settings::MemoryManager::bRenderPassLogFrameAnomalies.GetValue();
+            s_nullFrameCount = 0;
+            s_agedFrameCount = 0;
 
             REL::Relocation allocate{ RELOCATION_ID(100717, 107497) };
             REL::Relocation deallocate{ RELOCATION_ID(100718, 107498) };
