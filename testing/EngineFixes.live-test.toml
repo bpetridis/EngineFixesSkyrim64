@@ -15,7 +15,6 @@
 # bRenderPassQuarantineLights = true, so this patch performs ZERO frees.
 # See CLAUDE-HANDOFF.md for the experiment matrix and results.
 # ============================================================================
-
 # Engine Fixes - unified build for Skyrim SE 1.5.97, AE 1.6.1170, and VR 1.4.15
 # Settings marked (VR-only) are ignored on SE/AE; all others apply to all three runtimes.
 # User overrides go in EngineFixesCustom.toml (created alongside this file).
@@ -119,6 +118,7 @@ uRenderPassQuarantineSize = 65536               # freed render passes held befor
 uRenderPassQuarantineFrames = 100000                # DIAGNOSTIC, remove before ship: frames a retired render pass is held before release, clamped 1-100000
 bRenderPassQuarantineLights = true              # DIAGNOSTIC, remove before ship: when true, SetLights leaks the old sceneLights array instead of freeing it
 bRenderPassLogFrameAnomalies = true             # DIAGNOSTIC, remove before ship: logs when the render frame counter is null or jumps during quarantine drain
+bRenderPassDumpOriginalCode = true          # DIAGNOSTIC, remove before ship: hex-dumps the original bytes of the render pass cache functions before patching them
 bOverrideHavokMemorySystem = true               # overrides Havok's memory manager with direct malloc/free calls
 bReplaceImports = true                          # replace imported CRT memory functions with selected allocator
 

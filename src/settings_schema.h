@@ -110,6 +110,7 @@
     X(U32, uRenderPassQuarantineFrames, 3, "DIAGNOSTIC, remove before ship: frames a retired render pass is held before release, clamped 1-100000")        \
     X(Bool, bRenderPassQuarantineLights, false, "DIAGNOSTIC, remove before ship: when true, SetLights leaks the old sceneLights array instead of freeing it") \
     X(Bool, bRenderPassLogFrameAnomalies, false, "DIAGNOSTIC, remove before ship: logs when the render frame counter is null or jumps during quarantine drain") \
+    X(Bool, bRenderPassDumpOriginalCode, false, "DIAGNOSTIC, remove before ship: hex-dumps the original bytes of the render pass cache functions before patching them") \
     X(Bool, bOverrideHavokMemorySystem, true, "overrides Havok's memory manager with direct malloc/free calls")                                            \
     X(Bool, bReplaceImports, true, "replace imported CRT memory functions with selected allocator")
 

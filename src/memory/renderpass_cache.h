@@ -242,6 +242,35 @@ namespace Memory::RenderPassCache
             ++s_count;
         }
 
+
+        // DIAGNOSTIC (see CLAUDE-HANDOFF.md), remove before ship: SkyrimVR.exe ships
+        // SteamStub-encrypted (a .bind section, and zero standard prologues in .text on
+        // disk), so the engine's original code for these functions exists in readable
+        // form only in the decrypted in-memory image. Dump it before the patch
+        // overwrites anything, so the stubbed-out Init/Kill/Clear can be disassembled
+        // offline and we can learn what contract stubbing them to RET actually breaks.
+        inline bool s_dumpOriginalCode = false;
+
+        inline void DumpOriginalCode(std::string_view a_name, std::uintptr_t a_addr, std::size_t a_size)
+        {
+            static constexpr char kHex[] = "0123456789ABCDEF";
+
+            const auto* bytes = reinterpret_cast<const std::uint8_t*>(a_addr);
+            logger::info("ORIGCODE {} addr={:X} size={:X}"sv, a_name, a_addr, a_size);
+
+            std::string line;
+            line.reserve(64);
+            for (std::size_t i = 0; i < a_size; i += 32) {
+                const auto n = (std::min)(static_cast<std::size_t>(32), a_size - i);
+                line.clear();
+                for (std::size_t j = 0; j < n; ++j) {
+                    const auto b = bytes[i + j];
+                    line.push_back(kHex[b >> 4]);
+                    line.push_back(kHex[b & 0x0F]);
+                }
+                logger::info("ORIGCODE {} +{:03X} {}"sv, a_name, i, line);
+            }
+        }
         // Returns the ring capacity to use: uRenderPassQuarantineSize clamped to
         // [kMinQuarantined, kMaxQuarantined] and rounded up to a power of two so the
         // wrap in Deallocate stays a mask.
@@ -279,6 +308,24 @@ namespace Memory::RenderPassCache
             REL::Relocation setlights{ RELOCATION_ID(100711, 107490) };
             REL::Relocation init{ RELOCATION_ID(100720, 107500) };
             REL::Relocation kill{ RELOCATION_ID(100721, 107501) };
+            REL::Relocation clearFn{ RELOCATION_ID(100722, 107502) };
+
+            // DIAGNOSTIC (see CLAUDE-HANDOFF.md), remove before ship: must run BEFORE
+            // any replace_func/write_fill below, or we dump our own patch bytes.
+            s_dumpOriginalCode = Settings::MemoryManager::bRenderPassDumpOriginalCode.GetValue();
+            if (s_dumpOriginalCode) {
+                DumpOriginalCode("Allocate"sv, allocate.address(), 0x200);
+                DumpOriginalCode("Deallocate"sv, deallocate.address(), 0x200);
+                DumpOriginalCode("SetLights"sv, setlights.address(), 0x200);
+                DumpOriginalCode("Init"sv, init.address(), 0x200);
+                DumpOriginalCode("Kill"sv, kill.address(), 0x200);
+                DumpOriginalCode("Clear"sv, clearFn.address(), 0x200);
+                if (!REL::Module::IsAE()) {
+                    REL::Relocation setFn{ REL::ID(100710) };
+                    DumpOriginalCode("Set"sv, setFn.address(), 0x200);
+                }
+            }
+
             allocate.replace_func(VAR_NUM(0x9A, 0xF9), Allocate);
             deallocate.replace_func(VAR_NUM(0x60, 0x68), Deallocate);
             setlights.replace_func(0x69, SetLights);
