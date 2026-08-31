@@ -25,6 +25,20 @@ namespace Memory::RenderPassCache
         // render-thread compile stall that previously made the window rare, exposing
         // it on essentially every cell load.
         //
+        // CORRECTION (2026-08-31, from the Test 5 result -- see git history): the
+        // paragraph above describes why this quarantine was written, and it does
+        // guard a genuine hazard, but it is NOT the cause of the MapMenu/
+        // ShadowSceneNode CTD this branch chased. A run configured to perform ZERO
+        // frees -- nothing aged out, every pass leaked, every lights array leaked --
+        // still crashed with the same signature in under four minutes. That falsified
+        // every free-timing hypothesis at once. The actual root cause was the
+        // sceneLights array size contract; see the comment on SetLights below.
+        // The quarantine is kept because it is cheap and the hazard it describes is
+        // real, but note that its original justification (matching an observed crash
+        // cluster) is now suspect -- that cluster was very likely the sceneLights
+        // overread all along. Whether to keep it at all is an open question worth
+        // revisiting once the sceneLights fix has been validated in the field.
+        //
         // Freed passes are parked intact (including their sceneLights) in a FIFO
         // ring tagged with the engine frame (BSGraphics::State::frameCount) and
         // physically freed only once kQuarantineFrames frames have elapsed -- past
@@ -51,13 +65,12 @@ namespace Memory::RenderPassCache
         // the wrap is a mask, not a division), restoring the safety of the engine's
         // original pool (freed memory stays pass-shaped) while keeping EF's dynamic
         // growth.
-        // DIAGNOSTIC (see CLAUDE-HANDOFF.md), remove before ship: kQuarantineFrames is
-        // now a runtime value driven by uRenderPassQuarantineFrames, so hypothesis H1
-        // (frame-count aging vs. wall-clock hazard) can be A/B'd without recompiling.
-        // Set in Install(), clamped to [kMinQuarantineFrames, kMaxQuarantineFrames].
-        inline std::uint32_t          s_quarantineFrames = 3;
-        inline constexpr std::uint32_t kMinQuarantineFrames = 1;
-        inline constexpr std::uint32_t kMaxQuarantineFrames = 100000;
+        // Frames a retired pass is held before release. Three frames clears any
+        // plausible in-flight draw; the test matrix in git history found no evidence
+        // that widening it helps (hypothesis H1, frame-count aging vs. a wall-clock
+        // hazard, was falsified -- see the sceneLights fix in SetLights for the actual
+        // root cause), so this stays a constant rather than a tunable.
+        inline constexpr std::uint32_t kQuarantineFrames = 3;
         inline constexpr std::uint32_t kRetiredTag = 0xD1ED0FF5u;  // pad44 sentinel: pass is quarantined
 
         // uRenderPassQuarantineSize is rounded up to a power of two and clamped to
@@ -72,16 +85,6 @@ namespace Memory::RenderPassCache
         // sustained overflow by an unbounded factor.
         inline constexpr std::uint64_t kOverflowLogInterval = 4096;
 
-        // DIAGNOSTIC (see CLAUDE-HANDOFF.md), remove before ship: gated by
-        // bRenderPassLogFrameAnomalies. kFrameAnomalyAgeThreshold flags a drained
-        // entry whose age is implausible for a healthy quarantine -- evidence of a
-        // frame-counter jump (hypothesis H1). Both anomaly warnings are rate-limited
-        // the same way the overflow warning is.
-        inline constexpr std::uint32_t kFrameAnomalyAgeThreshold = 1000;
-        inline constexpr std::uint64_t kAnomalyLogInterval = 256;
-        inline bool                    s_logFrameAnomalies = false;
-        inline std::uint64_t           s_nullFrameCount = 0;
-        inline std::uint64_t           s_agedFrameCount = 0;
 
         struct RetiredPass
         {
@@ -101,11 +104,6 @@ namespace Memory::RenderPassCache
             if (state)
                 return state->frameCount;
 
-            if (s_logFrameAnomalies && s_nullFrameCount++ % kAnomalyLogInterval == 0) {
-                logger::warn(
-                    "render pass cache: BSGraphics::State singleton null, frame stamped 0 ({} so far)"sv,
-                    s_nullFrameCount);
-            }
             return 0;
         }
 
@@ -229,14 +227,8 @@ namespace Memory::RenderPassCache
             while (s_count > 0) {
                 const auto& oldest = s_ring[(s_head + s_ring.size() - s_count) & s_mask];
                 const auto  age = now - oldest.frame;
-                if (age < s_quarantineFrames)
+                if (age < kQuarantineFrames)
                     break;
-                if (s_logFrameAnomalies && age > kFrameAnomalyAgeThreshold && s_agedFrameCount++ % kAnomalyLogInterval == 0) {
-                    logger::warn(
-                        "render pass cache: drained a pass aged {} frames (quarantine is {}) -- possible frame "
-                        "counter jump ({} so far)"sv,
-                        age, s_quarantineFrames, s_agedFrameCount);
-                }
                 DropOldest(true);
             }
 
@@ -259,35 +251,6 @@ namespace Memory::RenderPassCache
             ++s_count;
         }
 
-
-        // DIAGNOSTIC (see CLAUDE-HANDOFF.md), remove before ship: SkyrimVR.exe ships
-        // SteamStub-encrypted (a .bind section, and zero standard prologues in .text on
-        // disk), so the engine's original code for these functions exists in readable
-        // form only in the decrypted in-memory image. Dump it before the patch
-        // overwrites anything, so the stubbed-out Init/Kill/Clear can be disassembled
-        // offline and we can learn what contract stubbing them to RET actually breaks.
-        inline bool s_dumpOriginalCode = false;
-
-        inline void DumpOriginalCode(std::string_view a_name, std::uintptr_t a_addr, std::size_t a_size)
-        {
-            static constexpr char kHex[] = "0123456789ABCDEF";
-
-            const auto* bytes = reinterpret_cast<const std::uint8_t*>(a_addr);
-            logger::info("ORIGCODE {} addr={:X} size={:X}"sv, a_name, a_addr, a_size);
-
-            std::string line;
-            line.reserve(64);
-            for (std::size_t i = 0; i < a_size; i += 32) {
-                const auto n = (std::min)(static_cast<std::size_t>(32), a_size - i);
-                line.clear();
-                for (std::size_t j = 0; j < n; ++j) {
-                    const auto b = bytes[i + j];
-                    line.push_back(kHex[b >> 4]);
-                    line.push_back(kHex[b & 0x0F]);
-                }
-                logger::info("ORIGCODE {} +{:03X} {}"sv, a_name, i, line);
-            }
-        }
         // Returns the ring capacity to use: uRenderPassQuarantineSize clamped to
         // [kMinQuarantined, kMaxQuarantined] and rounded up to a power of two so the
         // wrap in Deallocate stays a mask.
@@ -312,35 +275,12 @@ namespace Memory::RenderPassCache
             s_count = 0;
             s_dropped = 0;
 
-            // DIAGNOSTIC (see CLAUDE-HANDOFF.md), remove before ship.
-            s_quarantineFrames = std::clamp(
-                Settings::MemoryManager::uRenderPassQuarantineFrames.GetValue(), kMinQuarantineFrames, kMaxQuarantineFrames);
-            s_logFrameAnomalies = Settings::MemoryManager::bRenderPassLogFrameAnomalies.GetValue();
-            s_nullFrameCount = 0;
-            s_agedFrameCount = 0;
 
             REL::Relocation allocate{ RELOCATION_ID(100717, 107497) };
             REL::Relocation deallocate{ RELOCATION_ID(100718, 107498) };
             REL::Relocation setlights{ RELOCATION_ID(100711, 107490) };
             REL::Relocation init{ RELOCATION_ID(100720, 107500) };
             REL::Relocation kill{ RELOCATION_ID(100721, 107501) };
-            REL::Relocation clearFn{ RELOCATION_ID(100722, 107502) };
-
-            // DIAGNOSTIC (see CLAUDE-HANDOFF.md), remove before ship: must run BEFORE
-            // any replace_func/write_fill below, or we dump our own patch bytes.
-            s_dumpOriginalCode = Settings::MemoryManager::bRenderPassDumpOriginalCode.GetValue();
-            if (s_dumpOriginalCode) {
-                DumpOriginalCode("Allocate"sv, allocate.address(), 0x200);
-                DumpOriginalCode("Deallocate"sv, deallocate.address(), 0x200);
-                DumpOriginalCode("SetLights"sv, setlights.address(), 0x200);
-                DumpOriginalCode("Init"sv, init.address(), 0x200);
-                DumpOriginalCode("Kill"sv, kill.address(), 0x200);
-                DumpOriginalCode("Clear"sv, clearFn.address(), 0x200);
-                if (!REL::Module::IsAE()) {
-                    REL::Relocation setFn{ REL::ID(100710) };
-                    DumpOriginalCode("Set"sv, setFn.address(), 0x200);
-                }
-            }
 
             allocate.replace_func(VAR_NUM(0x9A, 0xF9), Allocate);
             deallocate.replace_func(VAR_NUM(0x60, 0x68), Deallocate);
