@@ -83,12 +83,6 @@ namespace Memory::RenderPassCache
         inline std::uint64_t           s_nullFrameCount = 0;
         inline std::uint64_t           s_agedFrameCount = 0;
 
-        // DIAGNOSTIC (see CLAUDE-HANDOFF.md), remove before ship: gated by
-        // bRenderPassQuarantineLights. Tests hypothesis H2 -- SetLights frees
-        // sceneLights immediately, with no quarantine at all. When true, the old
-        // array is leaked instead of freed.
-        inline bool s_quarantineLights = false;
-
         struct RetiredPass
         {
             RE::BSRenderPass* pass;
@@ -134,25 +128,48 @@ namespace Memory::RenderPassCache
             --s_count;
         }
 
+        // The engine gives every BSRenderPass a FIXED 16-entry sceneLights array.
+        // BSRenderPassCache::Init carves the pool's light block into 0x80-byte slices
+        // (0x80 / 8 == 16 pointers), one per pass, and stores the slice pointer at
+        // BSRenderPass+0x38; the array is never resized and never individually freed.
+        // The engine's own SetLights writes numLights entries and then explicitly
+        // ZERO-FILLS entries [numLights, 16) -- its `cmp dl, 0x10 / jae` tail. Engine
+        // code therefore relies on all 16 slots existing and being initialised, and
+        // reads past numLights (shadow lights live in the same array, counted by
+        // numShadowLights at +0x20).
+        //
+        // Sizing this array to numLights, as this patch previously did, turns every
+        // such read into a heap overread past the end of a small allocation, handing
+        // the engine a garbage BSLight* that it then refcounts. That is a corruption
+        // path with no relationship to when anything is freed -- which is why leaking
+        // every pass and every lights array (Test 5) did not stop the CTD.
+        //
+        // Match the engine exactly: always 16 entries, always zero-filled past
+        // numLights, never reallocated once attached to a pass.
+        inline constexpr std::size_t kSceneLights = 16;
+
+        inline RE::BSLight** AllocateSceneLights()
+        {
+            auto* lights = static_cast<RE::BSLight**>(
+                Allocator::GetAllocator()->AllocateAligned(sizeof(RE::BSLight*) * kSceneLights, 8));
+            std::memset(lights, 0, sizeof(RE::BSLight*) * kSceneLights);
+            return lights;
+        }
+
         inline void SetLights(RE::BSRenderPass* a_renderPass, uint8_t a_numLights, RE::BSLight** a_lights)
         {
-            if (a_numLights != a_renderPass->numLights) {
-                if (a_renderPass->sceneLights) {
-                    // DIAGNOSTIC (see CLAUDE-HANDOFF.md), remove before ship: tests H2 by
-                    // never releasing this array. Leaking is unambiguous; a real fix would
-                    // need its own quarantine, not attempted here.
-                    if (!s_quarantineLights)
-                        Allocator::GetAllocator()->DeallocateAligned(a_renderPass->sceneLights);
-                    a_renderPass->sceneLights = nullptr;
-                }
-                if (a_numLights != 0) {
-                    a_renderPass->sceneLights = static_cast<RE::BSLight**>(Allocator::GetAllocator()->AllocateAligned(sizeof(RE::BSLight*) * a_numLights, 8));
-                }
-                a_renderPass->numLights = a_numLights;
-            }
+            if (a_renderPass->sceneLights == nullptr)
+                a_renderPass->sceneLights = AllocateSceneLights();
 
-            for (uint32_t i = 0; i < a_numLights; i++)
+            // The engine trusts numLights <= 16 because its array is exactly that big;
+            // clamp the copy so a bogus count cannot run off the end of ours either.
+            const auto copy = (std::min)(static_cast<std::size_t>(a_numLights), kSceneLights);
+            for (std::size_t i = 0; i < copy; ++i)
                 a_renderPass->sceneLights[i] = a_lights[i];
+            for (std::size_t i = copy; i < kSceneLights; ++i)
+                a_renderPass->sceneLights[i] = nullptr;
+
+            a_renderPass->numLights = a_numLights;
         }
 
         inline void Set(RE::BSRenderPass* a_renderPass, RE::BSShader* a_shader, RE::BSShaderProperty* a_property, RE::BSGeometry* a_geometry, uint32_t a_passEnum, uint8_t a_numLights, RE::BSLight** a_lights)
@@ -298,7 +315,6 @@ namespace Memory::RenderPassCache
             // DIAGNOSTIC (see CLAUDE-HANDOFF.md), remove before ship.
             s_quarantineFrames = std::clamp(
                 Settings::MemoryManager::uRenderPassQuarantineFrames.GetValue(), kMinQuarantineFrames, kMaxQuarantineFrames);
-            s_quarantineLights = Settings::MemoryManager::bRenderPassQuarantineLights.GetValue();
             s_logFrameAnomalies = Settings::MemoryManager::bRenderPassLogFrameAnomalies.GetValue();
             s_nullFrameCount = 0;
             s_agedFrameCount = 0;
