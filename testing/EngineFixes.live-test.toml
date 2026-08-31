@@ -10,8 +10,9 @@
 # Skyrim/Data/SKSE/Plugins/EngineFixes.toml, and the real source of truth for
 # defaults is src/settings_schema.h.
 #
-# Current test: Test 3 (H2 isolation) -- uRenderPassQuarantineFrames = 3,
-# bRenderPassQuarantineLights = true, bRenderPassLogFrameAnomalies = true.
+# Current test: Test 5 (leak-everything falsification) -- uRenderPassQuarantineFrames
+# = 100000 with uRenderPassQuarantineSize = 65536 (ring saturates on purpose) and
+# bRenderPassQuarantineLights = true, so this patch performs ZERO frees.
 # See CLAUDE-HANDOFF.md for the experiment matrix and results.
 # ============================================================================
 
@@ -115,7 +116,7 @@ bOverrideMemoryManager = true                   # overrides Skyrim's memory mana
 bOverrideScaleformAllocator = true              # overrides Skyrim's scaleform allocator with calls to the global memory manager
 bOverrideRenderPassCache = true                 # overrides Skyrim's render pass cache with direct malloc/free calls
 uRenderPassQuarantineSize = 65536               # freed render passes held before release; raise if the log reports the quarantine overflowing (16 bytes each, rounded up to a power of two, clamped 1024-4194304)
-uRenderPassQuarantineFrames = 3                 # DIAGNOSTIC, remove before ship: frames a retired render pass is held before release, clamped 1-100000
+uRenderPassQuarantineFrames = 100000                # DIAGNOSTIC, remove before ship: frames a retired render pass is held before release, clamped 1-100000
 bRenderPassQuarantineLights = true              # DIAGNOSTIC, remove before ship: when true, SetLights leaks the old sceneLights array instead of freeing it
 bRenderPassLogFrameAnomalies = true             # DIAGNOSTIC, remove before ship: logs when the render frame counter is null or jumps during quarantine drain
 bOverrideHavokMemorySystem = true               # overrides Havok's memory manager with direct malloc/free calls
