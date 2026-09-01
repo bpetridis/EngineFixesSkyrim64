@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstring>
 #include <mutex>
 #include <new>
 #include <vector>
@@ -19,25 +20,23 @@ namespace Memory::RenderPassCache
         // it was freed: a stale entry left in a pass bucket is iterated, and with
         // immediate free the slot has already been handed to an unrelated
         // allocation, so Pass->shader (offset 0) reads back a garbage vftable ->
-        // execute-AV CTD. This is the unfixed root of the Community Shaders conflict
-        // (CS issue #1601 -- the CS-side guards only validate Pass->sceneLights[],
-        // never Pass->shader). CS background shader compilation removes the
-        // render-thread compile stall that previously made the window rare, exposing
-        // it on essentially every cell load.
+        // execute-AV CTD. The Community Shaders guards do not cover this: they
+        // validate Pass->sceneLights[], never Pass->shader (CS issue #1601). CS
+        // background shader compilation removes the render-thread compile stall
+        // that previously made the window rare, exposing it on essentially every
+        // cell load.
         //
-        // CORRECTION (2026-08-31, from the Test 5 result -- see git history): the
-        // paragraph above describes why this quarantine was written, and it does
-        // guard a genuine hazard, but it is NOT the cause of the MapMenu/
-        // ShadowSceneNode CTD this branch chased. A run configured to perform ZERO
-        // frees -- nothing aged out, every pass leaked, every lights array leaked --
-        // still crashed with the same signature in under four minutes. That falsified
-        // every free-timing hypothesis at once. The actual root cause was the
-        // sceneLights array size contract; see the comment on SetLights below.
-        // The quarantine is kept because it is cheap and the hazard it describes is
-        // real, but note that its original justification (matching an observed crash
-        // cluster) is now suspect -- that cluster was very likely the sceneLights
-        // overread all along. Whether to keep it at all is an open question worth
-        // revisiting once the sceneLights fix has been validated in the field.
+        // Scope note, because this quarantine is easy to over-credit: it guards
+        // the hazard above, but it is NOT what caused the MapMenu/ShadowSceneNode
+        // CTD cluster this file was long blamed for. A build configured to
+        // perform no frees whatsoever -- nothing aged out of the ring, every pass
+        // and every sceneLights array deliberately leaked -- still crashed with
+        // the identical signature in under four minutes, which rules out free
+        // timing as that cause entirely. The real cause was the sceneLights array
+        // size contract; see the comment on SetLights below. The quarantine is
+        // kept because it is cheap and the hazard it describes is real, but its
+        // original justification (matching an observed crash cluster) is suspect:
+        // that cluster was very likely the sceneLights overread all along.
         //
         // Freed passes are parked intact (including their sceneLights) in a FIFO
         // ring tagged with the engine frame (BSGraphics::State::frameCount) and
@@ -65,11 +64,13 @@ namespace Memory::RenderPassCache
         // the wrap is a mask, not a division), restoring the safety of the engine's
         // original pool (freed memory stays pass-shaped) while keeping EF's dynamic
         // growth.
+
         // Frames a retired pass is held before release. Three frames clears any
-        // plausible in-flight draw; the test matrix in git history found no evidence
-        // that widening it helps (hypothesis H1, frame-count aging vs. a wall-clock
-        // hazard, was falsified -- see the sceneLights fix in SetLights for the actual
-        // root cause), so this stays a constant rather than a tunable.
+        // plausible in-flight draw. Widening it was measured and showed no
+        // benefit: the age is counted in engine frames rather than wall clock,
+        // but a frozen counter holds passes longer rather than releasing them
+        // early, so the margin is never the thin end. It therefore stays a
+        // constant rather than a tunable.
         inline constexpr std::uint32_t kQuarantineFrames = 3;
         inline constexpr std::uint32_t kRetiredTag = 0xD1ED0FF5u;  // pad44 sentinel: pass is quarantined
 
@@ -81,10 +82,9 @@ namespace Memory::RenderPassCache
 
         // Log the first overflow, then at most one line per this many drops, so a
         // sustained overflow is visible in the log without flooding it. The previous
-        // `static bool warned` logged exactly once per session, which understated a
-        // sustained overflow by an unbounded factor.
+        // implementation logged exactly once per session (a static bool), which
+        // understated a sustained overflow by an unbounded factor.
         inline constexpr std::uint64_t kOverflowLogInterval = 4096;
-
 
         struct RetiredPass
         {
@@ -131,16 +131,16 @@ namespace Memory::RenderPassCache
         // (0x80 / 8 == 16 pointers), one per pass, and stores the slice pointer at
         // BSRenderPass+0x38; the array is never resized and never individually freed.
         // The engine's own SetLights writes numLights entries and then explicitly
-        // ZERO-FILLS entries [numLights, 16) -- its `cmp dl, 0x10 / jae` tail. Engine
-        // code therefore relies on all 16 slots existing and being initialised, and
-        // reads past numLights (shadow lights live in the same array, counted by
-        // numShadowLights at +0x20).
+        // zero-fills the remaining slots out to 16 (the cmp dl, 0x10 / jae tail at
+        // SetLights+0x37). Engine code therefore relies on all 16 slots existing
+        // and being initialised, and reads past numLights: shadow lights live in
+        // the same array, counted by numShadowLights at +0x20.
         //
         // Sizing this array to numLights, as this patch previously did, turns every
         // such read into a heap overread past the end of a small allocation, handing
         // the engine a garbage BSLight* that it then refcounts. That is a corruption
         // path with no relationship to when anything is freed -- which is why leaking
-        // every pass and every lights array (Test 5) did not stop the CTD.
+        // every pass and every lights array did not stop the CTD.
         //
         // Match the engine exactly: always 16 entries, always zero-filled past
         // numLights, never reallocated once attached to a pass.
@@ -274,7 +274,6 @@ namespace Memory::RenderPassCache
             s_head = 0;
             s_count = 0;
             s_dropped = 0;
-
 
             REL::Relocation allocate{ RELOCATION_ID(100717, 107497) };
             REL::Relocation deallocate{ RELOCATION_ID(100718, 107498) };
