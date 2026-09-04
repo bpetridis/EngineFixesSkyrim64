@@ -82,6 +82,7 @@ fWaterflowSpeed = 20.0                          # 20.0 = default, smaller = slow
 bOverrideMemoryManager = true                   # overrides Skyrim's memory manager and scrap heap with direct malloc/free calls (both always enabled together)
 bOverrideScaleformAllocator = true              # overrides Skyrim's scaleform allocator with calls to the global memory manager
 bOverrideRenderPassCache = true                 # overrides Skyrim's render pass cache with direct malloc/free calls
+uRenderPassQuarantineSize = 65536               # freed render passes held before release; raise if the log reports the quarantine overflowing (16 bytes each, rounded up to a power of two, clamped 1024-4194304)
 bOverrideHavokMemorySystem = true               # overrides Havok's memory manager with direct malloc/free calls
 bReplaceImports = true                          # replace imported CRT memory functions with selected allocator
 
