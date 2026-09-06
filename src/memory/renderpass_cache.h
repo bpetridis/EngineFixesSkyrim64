@@ -2,6 +2,7 @@
 #include "memory/allocator.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cstring>
 #include <mutex>
@@ -35,7 +36,7 @@ namespace Memory::RenderPassCache
         // by one per call, so a frozen counter (loading screen, pause) holds passes
         // longer rather than freeing them early.
         //
-        // OVERFLOW POLICY. The ring is bounded so memory cannot run away. When it
+        // OVERFLOW POLICY. The tracking ring has a fixed size. When it
         // fills, every entry is by construction YOUNGER than kQuarantineFrames --
         // the drain loop in Deallocate has already released everything older -- so
         // freeing the oldest to make room would hand back exactly the memory this
@@ -44,9 +45,10 @@ namespace Memory::RenderPassCache
         // down and rebuilds the scene graph the render frame counter stops advancing,
         // so nothing drains while retires pour in. The ring therefore DROPS the oldest
         // reference without freeing it -- the pass is leaked, ~72 bytes plus its
-        // sceneLights array -- and logs. Leaking a bounded amount is strictly
-        // preferable to a UAF CTD, and uRenderPassQuarantineSize lets the ring be
-        // sized so overflow does not happen at all. Retire stays allocation-free
+        // sceneLights array -- and logs. The ring itself is bounded, but the leaking
+        // is not: a frozen frame counter can leak one further pass per retirement for
+        // as long as retires keep arriving, so uRenderPassQuarantineSize should be
+        // sized to keep this fail-safe path exceptional. Retire stays allocation-free
         // (the ring is sized once at Install and its capacity is a power of two, so
         // the wrap is a mask, not a division), restoring the safety of the engine's
         // original pool (freed memory stays pass-shaped) while keeping EF's dynamic
@@ -79,6 +81,11 @@ namespace Memory::RenderPassCache
         inline std::size_t   s_sceneLights = 16;
         inline std::uint64_t s_lightOverruns = 0;
 
+        // Times SetLights was asked for more lights than the contract holds. Atomic
+        // because SetLights runs off the retire mutex, on whatever thread builds the
+        // pass.
+        inline std::atomic<std::uint64_t> s_lightCountClamps{ 0 };
+
         // uRenderPassQuarantineSize is rounded up to a power of two and clamped to
         // this range. The floor keeps a pathological setting from degenerating into
         // "leak everything"; the ceiling bounds the ring itself at 64 MB.
@@ -98,7 +105,7 @@ namespace Memory::RenderPassCache
         inline std::size_t              s_mask = 0;   // capacity - 1 (capacity is a power of two)
         inline std::size_t              s_head = 0;   // next write slot
         inline std::size_t              s_count = 0;  // live entries
-        inline std::uint64_t            s_dropped = 0;
+        inline std::uint64_t            s_overflowLeaks = 0;
         inline std::mutex               s_retireMutex;
 
         inline std::uint32_t CurrentFrame()
@@ -216,7 +223,23 @@ namespace Memory::RenderPassCache
             for (std::size_t i = copy; i < s_sceneLights; ++i)
                 a_renderPass->sceneLights[i] = nullptr;
 
-            a_renderPass->numLights = a_numLights;
+            if (copy != a_numLights) {
+                const auto clamps = s_lightCountClamps.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (clamps == 1 || clamps % kOverflowLogInterval == 0) {
+                    logger::warn(
+                        "render pass requested {} scene lights with capacity {}; truncating the count "
+                        "({} occurrences) -- raise uRenderPassSceneLights"sv,
+                        a_numLights, s_sceneLights, clamps);
+                }
+            }
+
+            // The count and the storage must describe the same safe range: publishing
+            // the caller's unclamped count while storing only `copy` entries tells a
+            // consumer to read past what was written. Shadow lights live in this same
+            // array past numLights (counted by numShadowLights), so truncating here
+            // also shifts where the engine believes they start -- wrong lighting, but
+            // bounded, where the alternative is a read off the end of the allocation.
+            a_renderPass->numLights = static_cast<std::uint8_t>(copy);
         }
 
         inline void Set(RE::BSRenderPass* a_renderPass, RE::BSShader* a_shader, RE::BSShaderProperty* a_property, RE::BSGeometry* a_geometry, uint32_t a_passEnum, uint8_t a_numLights, RE::BSLight** a_lights)
@@ -281,7 +304,13 @@ namespace Memory::RenderPassCache
             // handing it to the allocator would be a wild free. Leaking it is free of
             // consequence by comparison -- Allocate has replaced the pool, so nothing
             // else will ever reclaim it either way.
-            if (a_renderPass->cachePoolId != kOurPassTag && a_renderPass->pad44 != kRetiredTag) {
+            // cachePoolId alone decides ownership. The old form also required
+            // pad44 != kRetiredTag, which could not help: our own passes always carry
+            // kOurPassTag, so the first clause already excluded them. Its only effect
+            // was that a foreign pass whose pad44 happened to collide with the retired
+            // sentinel skipped this branch, fell to the double-Deallocate guard below
+            // and returned there instead -- leaked either way, but silently.
+            if (a_renderPass->cachePoolId != kOurPassTag) {
                 if (s_foreign++ % kOverflowLogInterval == 0) {
                     logger::error(
                         "render pass Deallocate called on a pass this patch did not allocate "
@@ -314,11 +343,12 @@ namespace Memory::RenderPassCache
             // Everything still queued is younger than kQuarantineFrames, so the
             // oldest is abandoned rather than freed -- see the overflow policy above.
             if (s_count == s_ring.size()) {
-                if (s_dropped++ % kOverflowLogInterval == 0) {
+                const auto leaked = ++s_overflowLeaks;
+                if (leaked == 1 || leaked % kOverflowLogInterval == 0) {
                     logger::warn(
                         "render pass quarantine full ({}); leaking oldest pass rather than freeing it early "
                         "({} leaked so far) -- raise uRenderPassQuarantineSize"sv,
-                        s_ring.size(), s_dropped);
+                        s_ring.size(), leaked);
                 }
                 DropOldest(false);
             }
@@ -347,8 +377,9 @@ namespace Memory::RenderPassCache
             s_sceneLights = std::clamp(
                 static_cast<std::size_t>(Settings::MemoryManager::uRenderPassSceneLights.GetValue()),
                 kSceneLightsMin, kSceneLightsMax);
-            logger::warn(
-                "SCENELIGHTS: contract {} entries per pass (allocating {}, canary on the remainder)"sv,
+            s_lightCountClamps.store(0, std::memory_order_relaxed);
+            logger::info(
+                "render pass scene-light contract: {} entries per pass (allocating {}, canary on the remainder)"sv,
                 s_sceneLights, kSceneLightsAlloc);
 
             const auto capacity = ResolveCapacity();
@@ -361,7 +392,7 @@ namespace Memory::RenderPassCache
             s_mask = capacity - 1;
             s_head = 0;
             s_count = 0;
-            s_dropped = 0;
+            s_overflowLeaks = 0;
 
             REL::Relocation allocate{ RELOCATION_ID(100717, 107497) };
             REL::Relocation deallocate{ RELOCATION_ID(100718, 107498) };
