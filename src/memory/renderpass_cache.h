@@ -76,10 +76,9 @@ namespace Memory::RenderPassCache
         // Passes rejected by that check, and whether the first one has been logged.
         inline std::uint64_t s_foreign = 0;
 
-        // TEST BUILD: sceneLights contract, resolved from uRenderPassSceneLights at
-        // Install; and the count of canary trips past it. See AllocateSceneLights.
-        inline std::size_t   s_sceneLights = 16;
-        inline std::uint64_t s_lightOverruns = 0;
+        // Published sceneLights count contract, resolved from uRenderPassSceneLights
+        // at Install. Storage is always kSceneLightsMax; see AllocateSceneLights.
+        inline std::size_t s_sceneLights = 16;
 
         // Times SetLights was asked for more lights than the contract holds. Atomic
         // because SetLights runs off the retire mutex, on whatever thread builds the
@@ -117,25 +116,10 @@ namespace Memory::RenderPassCache
             return 0;
         }
 
-        // TEST BUILD: declared here because FreeNow runs the check.
-        inline std::size_t CheckLightCanary(RE::BSLight* const* a_lights);
-
         inline void FreeNow(RE::BSRenderPass* a_renderPass)
         {
-            if (a_renderPass->sceneLights != nullptr) {
-                // TEST BUILD: did anything index past the configured contract?
-                if (const auto highest = CheckLightCanary(a_renderPass->sceneLights); highest != 0) {
-                    if (s_lightOverruns++ % 64 == 0) {
-                        logger::error(
-                            "SCENELIGHTS OVERRUN: slot {} written past the {}-entry contract "
-                            "(numLights {}, numShadowLights {}) -- raise uRenderPassSceneLights to at "
-                            "least {} ({} so far)"sv,
-                            highest, s_sceneLights, a_renderPass->numLights,
-                            a_renderPass->numShadowLights, highest + 1, s_lightOverruns);
-                    }
-                }
+            if (a_renderPass->sceneLights != nullptr)
                 Allocator::GetAllocator()->DeallocateAligned(a_renderPass->sceneLights);
-            }
             Allocator::GetAllocator()->DeallocateAligned(a_renderPass);
         }
 
@@ -166,9 +150,8 @@ namespace Memory::RenderPassCache
         // the engine a garbage BSLight* that it then refcounts -- a corruption path
         // with no relationship to when anything is freed.
         //
-        // Match the engine exactly: always 16 entries, always zero-filled past
-        // numLights, never reallocated once attached to a pass.
-        // TEST BUILD -- NOT FOR MERGE. The contract is configurable here so a mod that
+        // Match the engine exactly: zero-filled past numLights, never reallocated once
+        // attached to a pass. The published contract is configurable so a mod that
         // expands the native slice can be accommodated without a separate binary.
         //
         // Native Mesh Light Flicker Fix (Nexus 186432) states it performs "runtime
@@ -179,35 +162,22 @@ namespace Memory::RenderPassCache
         // entries while those loops index 26, slots 16..25 are read 80 bytes past the
         // end of our allocation. Set uRenderPassSceneLights = 26 to match it.
         //
-        // "26" comes from a mod description, not from measurement, so this build always
-        // ALLOCATES kSceneLightsAlloc entries regardless of the contract and canaries
-        // everything past it. Any consumer reading further lands in our own zeroed
-        // padding rather than the heap, and FreeNow reports the highest slot actually
-        // touched -- which is the number that matters, whatever the description says.
+        // "26" comes from a mod description, not from measurement. Storage is therefore
+        // always kSceneLightsMax slots regardless of the published contract, and every
+        // slot is zeroed: a consumer that indexes past the contract reads a null
+        // BSLight* out of memory we own, rather than a live pointer off the end of a
+        // smaller allocation. Nothing is poisoned with a sentinel -- a non-null value
+        // parked in pointer storage is exactly what the paragraph above warns about,
+        // since a consumer may refcount it before anyone notices it is not a light.
         inline constexpr std::size_t kSceneLightsMin = 16;
         inline constexpr std::size_t kSceneLightsMax = 64;
-        inline constexpr std::size_t kSceneLightsAlloc = 64;  // always this big; contract <= this
-        inline constexpr std::uint64_t kLightCanary = 0xC0DEC0DEC0DEC0DEull;
 
         inline RE::BSLight** AllocateSceneLights()
         {
             auto* lights = static_cast<RE::BSLight**>(
-                Allocator::GetAllocator()->AllocateAligned(sizeof(RE::BSLight*) * kSceneLightsAlloc, 8));
-            std::memset(lights, 0, sizeof(RE::BSLight*) * s_sceneLights);
-            for (std::size_t i = s_sceneLights; i < kSceneLightsAlloc; ++i)
-                lights[i] = reinterpret_cast<RE::BSLight*>(kLightCanary);
+                Allocator::GetAllocator()->AllocateAligned(sizeof(RE::BSLight*) * kSceneLightsMax, 8));
+            std::memset(lights, 0, sizeof(RE::BSLight*) * kSceneLightsMax);
             return lights;
-        }
-
-        // Highest slot past the contract that was written, or 0 if intact.
-        inline std::size_t CheckLightCanary(RE::BSLight* const* a_lights)
-        {
-            std::size_t highest = 0;
-            for (std::size_t i = s_sceneLights; i < kSceneLightsAlloc; ++i) {
-                if (reinterpret_cast<std::uintptr_t>(a_lights[i]) != kLightCanary)
-                    highest = i;
-            }
-            return highest;
         }
 
         inline void SetLights(RE::BSRenderPass* a_renderPass, uint8_t a_numLights, RE::BSLight** a_lights)
@@ -220,25 +190,31 @@ namespace Memory::RenderPassCache
             const auto copy = (std::min)(static_cast<std::size_t>(a_numLights), s_sceneLights);
             for (std::size_t i = 0; i < copy; ++i)
                 a_renderPass->sceneLights[i] = a_lights[i];
-            for (std::size_t i = copy; i < s_sceneLights; ++i)
-                a_renderPass->sceneLights[i] = nullptr;
+            // Clear to the full storage size, not just to the contract: this array is
+            // reused when a pass is refilled, so a shorter refill would otherwise leave
+            // live pointers from the previous use sitting past the new count.
+            std::memset(a_renderPass->sceneLights + copy, 0, sizeof(RE::BSLight*) * (kSceneLightsMax - copy));
 
             if (copy != a_numLights) {
+                // Shadow lights occupy the tail of the numLights range, so once that
+                // total is truncated the old shadow boundary no longer describes the
+                // copied layout. Fail closed: publishing zero loses shadow lighting in
+                // an already-misconfigured case, but it cannot turn the retained prefix
+                // into a falsely indexed shadow segment.
+                a_renderPass->numShadowLights = 0;
+
                 const auto clamps = s_lightCountClamps.fetch_add(1, std::memory_order_relaxed) + 1;
                 if (clamps == 1 || clamps % kOverflowLogInterval == 0) {
                     logger::warn(
-                        "render pass requested {} scene lights with capacity {}; truncating the count "
-                        "({} occurrences) -- raise uRenderPassSceneLights"sv,
+                        "render pass requested {} scene lights with contract {}; truncating the count "
+                        "and clearing shadow lights ({} occurrences) -- raise uRenderPassSceneLights"sv,
                         a_numLights, s_sceneLights, clamps);
                 }
             }
 
             // The count and the storage must describe the same safe range: publishing
             // the caller's unclamped count while storing only `copy` entries tells a
-            // consumer to read past what was written. Shadow lights live in this same
-            // array past numLights (counted by numShadowLights), so truncating here
-            // also shifts where the engine believes they start -- wrong lighting, but
-            // bounded, where the alternative is a read off the end of the allocation.
+            // consumer to read past what was written.
             a_renderPass->numLights = static_cast<std::uint8_t>(copy);
         }
 
@@ -371,16 +347,16 @@ namespace Memory::RenderPassCache
 
         inline bool Install()
         {
-            // TEST BUILD: resolve the sceneLights contract. Clamped so a bad value
-            // cannot make the array smaller than the engine's own 16-entry assumption
-            // or larger than what AllocateSceneLights actually reserves.
+            // Resolve the published sceneLights contract. Clamping keeps it no smaller
+            // than the engine own 16-entry assumption and no larger than the slots
+            // AllocateSceneLights reserves.
             s_sceneLights = std::clamp(
                 static_cast<std::size_t>(Settings::MemoryManager::uRenderPassSceneLights.GetValue()),
                 kSceneLightsMin, kSceneLightsMax);
             s_lightCountClamps.store(0, std::memory_order_relaxed);
             logger::info(
-                "render pass scene-light contract: {} entries per pass (allocating {}, canary on the remainder)"sv,
-                s_sceneLights, kSceneLightsAlloc);
+                "render pass scene-light contract: {} entries per pass ({} zeroed storage slots)"sv,
+                s_sceneLights, kSceneLightsMax);
 
             const auto capacity = ResolveCapacity();
             try {

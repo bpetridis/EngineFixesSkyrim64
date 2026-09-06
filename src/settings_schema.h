@@ -109,7 +109,7 @@
     X(Bool, bOverrideScaleformAllocator, true, "overrides Skyrim's scaleform allocator with calls to the global memory manager")                           \
     X(Bool, bOverrideRenderPassCache, true, "overrides Skyrim's render pass cache with direct malloc/free calls")                                          \
     X(U32, uRenderPassQuarantineSize, 65536, "freed render passes held before release; raise if the log reports the quarantine overflowing (16 bytes each, rounded up to a power of two, clamped 1024-4194304)") \
-    X(U32, uRenderPassSceneLights, 16, "scene-light array capacity; vanilla 16, Native Mesh Light Flicker Fix 26; larger counts are truncated (clamped 16-64)") \
+    X(U32, uRenderPassSceneLights, 16, "published scene-light contract; vanilla 16, Native Mesh Light Flicker Fix 26; larger counts are truncated (clamped 16-64; storage is always 64 zeroed slots)") \
     X(Bool, bOverrideHavokMemorySystem, true, "overrides Havok's memory manager with direct malloc/free calls")                                            \
     X(Bool, bReplaceImports, true, "replace imported CRT memory functions with selected allocator")
 
